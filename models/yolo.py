@@ -2,6 +2,7 @@ import argparse
 import logging
 import sys
 from copy import deepcopy
+from utils.activations import replace_activations
 
 sys.path.append('./')  # to run '$ python *.py' files in subdirectories
 logger = logging.getLogger(__name__)
@@ -810,8 +811,13 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         if i == 0:
             ch = []
         ch.append(c2)
-    return nn.Sequential(*layers), sorted(save)
+    model = nn.Sequential(*layers)
+    # override all activations in model if provided in config
+    if 'act' in d:
+        LOGGER.info(f'overriding activations in model to {d["act"]}')
+        replace_activations(model, d["act"])
 
+    return model, sorted(save)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
