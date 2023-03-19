@@ -21,6 +21,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+import torch.nn.utils.prune as prune
+import copy
+
 import test  # import test.py to get mAP after each epoch
 from models.experimental import attempt_load
 from models.yolo import Model
@@ -37,6 +40,83 @@ from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 
 logger = logging.getLogger(__name__)
 
+def remove_parameters(model):
+
+    for module_name, module in model.named_modules():
+        if isinstance(module, torch.nn.Conv2d):
+            try:
+                prune.remove(module, "weight")
+            except:
+                pass
+            try:
+                prune.remove(module, "bias")
+            except:
+                pass
+        elif isinstance(module, torch.nn.Linear):
+            try:
+                prune.remove(module, "weight")
+            except:
+                pass
+            try:
+                prune.remove(module, "bias")
+            except:
+                pass
+
+    return model
+
+def measure_module_sparsity(module, weight=True, bias=False, use_mask=False):
+
+    num_zeros = 0
+    num_elements = 0
+
+    if use_mask == True:
+        for buffer_name, buffer in module.named_buffers():
+            if "weight_mask" in buffer_name and weight == True:
+                num_zeros += torch.sum(buffer == 0).item()
+                num_elements += buffer.nelement()
+            if "bias_mask" in buffer_name and bias == True:
+                num_zeros += torch.sum(buffer == 0).item()
+                num_elements += buffer.nelement()
+    else:
+        for param_name, param in module.named_parameters():
+            if "weight" in param_name and weight == True:
+                num_zeros += torch.sum(param == 0).item()
+                num_elements += param.nelement()
+            if "bias" in param_name and bias == True:
+                num_zeros += torch.sum(param == 0).item()
+                num_elements += param.nelement()
+
+    sparsity = num_zeros / num_elements
+
+    return num_zeros, num_elements, sparsity
+
+def measure_global_sparsity(
+    model, weight = True,
+    bias = False, conv2d_use_mask = False,
+    linear_use_mask = False):
+
+    num_zeros = 0
+    num_elements = 0
+
+    for module_name, module in model.named_modules():
+
+        if isinstance(module, torch.nn.Conv2d):
+
+            module_num_zeros, module_num_elements, _ = measure_module_sparsity(
+                module, weight=weight, bias=bias, use_mask=conv2d_use_mask)
+            num_zeros += module_num_zeros
+            num_elements += module_num_elements
+
+        elif isinstance(module, torch.nn.Linear):
+
+            module_num_zeros, module_num_elements, _ = measure_module_sparsity(
+                module, weight=weight, bias=bias, use_mask=linear_use_mask)
+            num_zeros += module_num_zeros
+            num_elements += module_num_elements
+
+    sparsity = num_zeros / num_elements
+
+    return num_zeros, num_elements, sparsity
 
 def train(hyp, opt, device, tb_writer=None):
     logger.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
@@ -196,6 +276,15 @@ def train(hyp, opt, device, tb_writer=None):
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
     # plot_lr_scheduler(optimizer, scheduler, epochs)
 
+    # Pruning
+    
+    parameters_to_prune = []
+    for module_name, module in model.named_modules():
+        if isinstance(module, torch.nn.Conv2d):
+            parameters_to_prune.append((module, "weight"))
+        elif isinstance(module, torch.nn.Linear):
+            parameters_to_prune.append((module, "weight"))
+
     # EMA
     ema = ModelEMA(model) if rank in [-1, 0] else None
 
@@ -304,7 +393,45 @@ def train(hyp, opt, device, tb_writer=None):
                 f'Logging results to {save_dir}\n'
                 f'Starting training for {epochs} epochs...')
     torch.save(model, wdir / 'init.pt')
+    #prunning_start_epoch=80 # should be 16 for 81.47% sparsity or 12 for 71.75% sparsity
+    #prunning_end_epoch=230 # should be 16 for 81.47% sparsity or 12 for 71.75% sparsity
+    #sparsification_freq = 12
+    #target_sparsity = 0.7
+    
+    prunning_start_epoch=80 # should be 16 for 81.47% sparsity or 12 for 71.75% sparsity
+    prunning_end_epoch=230 # should be 16 for 81.47% sparsity or 12 for 71.75% sparsity
+    sparsification_freq = 12 # This is freq (in epochs) for sparsification events
+    target_sparsity = 0.75
+    sparsification_events = np.trunc((prunning_end_epoch-prunning_start_epoch)/sparsification_freq)+1
+    sparsification_amount_per_event = target_sparsity / sparsification_events
+    
+    # We check model sparsity and make sure masks are updated accordingly. This is mainly for resume cases - Dans
+    pruned_model = copy.deepcopy(model)
+    pruned_model = remove_parameters(pruned_model)
+    # Compute global sparsity-
+    num_zeros, num_elements, sparsity = measure_global_sparsity(
+        pruned_model, weight = True,
+        bias = False, conv2d_use_mask = False,
+        linear_use_mask = False)
+    prune.global_unstructured(
+        parameters_to_prune,
+        pruning_method = prune.L1Unstructured,
+        amount = sparsity,
+    )
+    print(f"Initial Global sparsity = {sparsity * 100:.3f}%0")
+    #model = remove_parameters(model)
+
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+        if epoch>=prunning_start_epoch and epoch<=prunning_end_epoch:
+            if ((epoch-prunning_start_epoch) % sparsification_freq) == 0:
+                model = remove_parameters(model) # dans - remove pruning masks from model and update weights of pruned elements to zero. This is so that when we prune the model below the "amount" parameter will be absolute and not in addition to models current sparsity
+                current_sparsification_event = (epoch-prunning_start_epoch) // sparsification_freq+1
+                current_sparsity = sparsification_amount_per_event * current_sparsification_event
+                prune.global_unstructured(
+                    parameters_to_prune,
+                    pruning_method = prune.L1Unstructured,
+                    amount = current_sparsity,
+                )
         model.train()
 
         # Update image weights (optional)
@@ -333,6 +460,7 @@ def train(hyp, opt, device, tb_writer=None):
         if rank in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
+        batch_count = 0
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
@@ -377,7 +505,17 @@ def train(hyp, opt, device, tb_writer=None):
                 scaler.update()
                 optimizer.zero_grad()
                 if ema:
+                    model = remove_parameters(model) # Dans, remove pruning masks from model and update weights of pruned elements to zero
+                    num_zeros, num_elements, sparsity = measure_global_sparsity(
+                        model, weight = True,
+                        bias = False, conv2d_use_mask = False,
+                        linear_use_mask = False)
                     ema.update(model)
+                    prune.global_unstructured( # Dans, add back pruning masks to model
+                        parameters_to_prune,
+                        pruning_method = prune.L1Unstructured,
+                        amount = sparsity,
+                    )
 
             # Print
             if rank in [-1, 0]:
@@ -397,6 +535,9 @@ def train(hyp, opt, device, tb_writer=None):
                 elif plots and ni == 10 and wandb_logger.wandb:
                     wandb_logger.log({"Mosaics": [wandb_logger.wandb.Image(str(x), caption=x.name) for x in
                                                   save_dir.glob('train*.jpg') if x.exists()]})
+            batch_count+=1
+            #if batch_count==2:
+            #    break # dans debug to do only 1 batch per epoch
 
             # end batch ------------------------------------------------------------------------------------------------
         # end epoch ----------------------------------------------------------------------------------------------------
@@ -407,15 +548,21 @@ def train(hyp, opt, device, tb_writer=None):
 
         # DDP process 0 or single-GPU
         if rank in [-1, 0]:
+            model = remove_parameters(model) # Dans, remove pruning masks from model and update weights of pruned elements to zero
+            num_zeros, num_elements, sparsity = measure_global_sparsity(
+                model, weight = True,
+                bias = False, conv2d_use_mask = False,
+                linear_use_mask = False)
             # mAP
-            ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights'])
+            if ema: # dans update ema attr only if ema enabled
+                ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights'])
             final_epoch = epoch + 1 == epochs
             if not opt.notest or final_epoch:  # Calculate mAP
                 wandb_logger.current_epoch = epoch + 1
                 results, maps, times = test.test(data_dict,
                                                  batch_size=batch_size * 2,
                                                  imgsz=imgsz_test,
-                                                 model=ema.ema,
+                                                 model=ema.ema if ema else deepcopy(de_parallel(model)), #dans
                                                  single_cls=opt.single_cls,
                                                  dataloader=testloader,
                                                  save_dir=save_dir,
@@ -425,6 +572,7 @@ def train(hyp, opt, device, tb_writer=None):
                                                  compute_loss=compute_loss,
                                                  is_coco=is_coco,
                                                  v5_metric=opt.v5_metric)
+                print(f"Global sparsity = {sparsity * 100:.3f}% & val_accuracy = {results[2] * 100:.3f}%")
 
             # Write
             with open(results_file, 'a') as f:
@@ -451,14 +599,26 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Save model
             if (not opt.nosave) or (final_epoch and not opt.evolve):  # if save
-                ckpt = {'epoch': epoch,
-                        'best_fitness': best_fitness,
-                        'training_results': results_file.read_text(),
-                        'model': deepcopy(model.module if is_parallel(model) else model).half(),
-                        'ema': deepcopy(ema.ema).half(),
-                        'updates': ema.updates,
-                        'optimizer': optimizer.state_dict(),
-                        'wandb_id': wandb_logger.wandb_run.id if wandb_logger.wandb else None}
+                if ema:
+                    ckpt = {'epoch': epoch,
+                            'best_fitness': best_fitness,
+                            'training_results': results_file.read_text(),
+                            'model': deepcopy(model.module if is_parallel(model) else model).half(),
+                            'ema': deepcopy(ema.ema).half(),
+                            'updates': ema.updates,
+                            'optimizer': optimizer.state_dict(),
+                            'wandb_id': wandb_logger.wandb_run.id if wandb_logger.wandb else None}
+                else:
+                    ckpt = {'epoch': epoch,
+                            'best_fitness': best_fitness,
+                            'training_results': results_file.read_text(),
+                            'model': deepcopy(model.module if is_parallel(model) else model).half(),
+                            'ema': None,
+                            'updates': None,
+                            'optimizer': optimizer.state_dict(),
+                            'wandb_id': wandb_logger.wandb_run.id if wandb_logger.wandb else None}
+
+
 
                 # Save last, best and delete
                 torch.save(ckpt, last)
@@ -477,6 +637,11 @@ def train(hyp, opt, device, tb_writer=None):
                         wandb_logger.log_model(
                             last.parent, opt, epoch, fi, best_model=best_fitness == fi)
                 del ckpt
+            prune.global_unstructured( # Dans, add back pruning masks to model
+                parameters_to_prune,
+                pruning_method = prune.L1Unstructured,
+                amount = sparsity,
+            )
 
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training
